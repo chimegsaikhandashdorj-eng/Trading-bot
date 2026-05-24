@@ -8,9 +8,6 @@ log = get_logger("RiskManager")
 # Захиалга орох үнийн зөрүүний дээд хязгаар (0.1%)
 SLIPPAGE_TOLERANCE = 0.001
 
-# 100 pip = 1000 point (5-decimal pair: EURUSD, GBPUSD, USDJPY)
-BREAKEVEN_TRIGGER_POINTS = 1000
-
 
 @dataclass
 class TradeDecision:
@@ -53,22 +50,36 @@ class RiskManager:
                 position_size=0, sl_points=0, tp_points=0,
             )
 
-        sentiment_factor = 1.0 if sentiment_confirmed else 0.5
+        # Sentiment-ийг strategy.confidence-д аль хэдийн оруулсан тул энд double-penalty болгохгүй
+        # (хуучин: sentiment_factor=0.5 → risk_amount хэт бага болгож байсан)
         risk_amount = (
             balance * (config.MAX_RISK_PER_TRADE / 100)
-            * sentiment_factor * technical_strength
+            * technical_strength
         )
 
         if is_forex:
             sl_points = 100
             tp_points = 200          # 1:2 R:R
-            pip_value = 10.0         # EURUSD: $10/pip/lot; Gold-д өөр байна
-            lot_size = round(risk_amount / (sl_points * pip_value / 10), 2)
+            pip_value = config.PIP_VALUES.get(symbol, 10.0)
+            # 1 standard lot-ийн SL-д хүрэх $ алдагдал = sl_points/10 (pip) × pip_value
+            sl_dollar_per_lot = (sl_points / 10) * pip_value
+            if sl_dollar_per_lot <= 0:
+                return TradeDecision(
+                    allowed=False,
+                    reason=f"{symbol}: pip_value тохиргоо буруу",
+                    position_size=0, sl_points=0, tp_points=0,
+                )
+            lot_size = round(risk_amount / sl_dollar_per_lot, 2)
             lot_size = max(0.01, min(lot_size, 10.0))
             position_size = lot_size
         else:
             sl_points = 0
             tp_points = 0
+            if current_price <= 0:
+                return TradeDecision(
+                    allowed=False, reason="Үнэ 0 эсвэл сөрөг",
+                    position_size=0, sl_points=0, tp_points=0,
+                )
             position_size = round(risk_amount / current_price, 6)
             position_size = max(0.0001, position_size)
 
@@ -85,16 +96,18 @@ class RiskManager:
         )
 
     def should_move_to_breakeven(
-        self, side: str, entry_price: float, current_price: float, point: float
+        self, side: str, entry_price: float, current_price: float, point: float,
+        symbol: str = "EURUSD",
     ) -> bool:
-        """100 pip (=1000 point) ашиг болоход SL-г breakeven (entry) дээр авчрах."""
+        """Тухайн symbol-ийн trigger хүртэл ашиг хүрсэн үед SL-г breakeven дээр шилжүүлнэ."""
         if point <= 0:
             return False
         profit_points = (
             (current_price - entry_price) / point if side == "buy"
             else (entry_price - current_price) / point
         )
-        return profit_points >= BREAKEVEN_TRIGGER_POINTS
+        trigger = config.BREAKEVEN_TRIGGER_POINTS.get(symbol, 1000)
+        return profit_points >= trigger
 
     @staticmethod
     def slippage_ok(expected_price: float, actual_price: float) -> bool:

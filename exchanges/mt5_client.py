@@ -1,5 +1,5 @@
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 import config
 from utils.logger import get_logger
@@ -64,7 +64,7 @@ class MT5Client:
 
     def is_market_open(self) -> bool:
         """Forex зах зээл амралтын өдөр (Бямба, Ням) хаалттай байдаг."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         weekday = now.weekday()   # Monday=0 ... Sunday=6
 
         # Ням гараг бүхэлдээ хаалттай
@@ -109,10 +109,14 @@ class MT5Client:
     # ── Үндсэн функцүүд ───────────────────────────────────────────────────────
 
     def get_balance(self) -> float:
+        """Equity (open P&L орсон) буцаана — risk calc-д баланс биш equity зөв."""
         if not self.connected:
             return 0.0
         info = mt5.account_info()
-        return info.balance if info else 0.0
+        if not info:
+            return 0.0
+        # equity нь баланс + одоогийн нээлттэй positions-ийн floating P&L
+        return float(getattr(info, "equity", info.balance))
 
     def get_ohlcv(self, symbol: str, timeframe: str = "1h", limit: int = 200) -> Optional[pd.DataFrame]:
         if not self.connected:
@@ -186,8 +190,11 @@ class MT5Client:
             "type_filling":  mt5.ORDER_FILLING_IOC,
         }
         result = mt5.order_send(request)
+        if result is None:
+            log.error(f"order_send None буцаалаа ({symbol}): {mt5.last_error()}")
+            return None
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            log.error(f"Захиалга алдаа: {result.comment}")
+            log.error(f"Захиалга алдаа [{result.retcode}]: {result.comment}")
             return None
         log.info(f"MT5 захиалга: {order_type} {volume} {symbol} @ {price:.5f} | SL={sl:.5f} TP={tp:.5f}")
         return {
@@ -220,10 +227,13 @@ class MT5Client:
             "tp":       pos.tp,
         }
         result = mt5.order_send(request)
+        if result is None:
+            log.error(f"Breakeven SL: order_send None ({ticket}): {mt5.last_error()}")
+            return False
         if result.retcode == mt5.TRADE_RETCODE_DONE:
             log.info(f"Ticket {ticket}: SL breakeven {entry_price:.5f} дээр шилжлээ")
             return True
-        log.error(f"Breakeven SL алдаа: {result.comment}")
+        log.error(f"Breakeven SL алдаа [{result.retcode}]: {result.comment}")
         return False
 
     def close_position(self, ticket: int) -> bool:
@@ -235,6 +245,9 @@ class MT5Client:
         pos = positions[0]
         close_type = mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY
         tick = mt5.symbol_info_tick(pos.symbol)
+        if tick is None:
+            log.error(f"close_position: tick авч чадсангүй ({pos.symbol})")
+            return False
         price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
         request = {
             "action":    mt5.TRADE_ACTION_DEAL,
@@ -248,6 +261,9 @@ class MT5Client:
             "comment":   "TradingBot close",
         }
         result = mt5.order_send(request)
+        if result is None:
+            log.error(f"close_position: order_send None ({ticket})")
+            return False
         return result.retcode == mt5.TRADE_RETCODE_DONE
 
     def get_open_positions(self) -> list:
@@ -255,6 +271,19 @@ class MT5Client:
             return []
         positions = mt5.positions_get()
         return list(positions) if positions else []
+
+    def get_closed_position_pnl(self, ticket: int) -> Optional[float]:
+        """Хаагдсан байрлалын P&L (closed deal-аас). Опен биш бол None буцаана."""
+        if not self.connected:
+            return None
+        # Деал-аас position_id-аар хайх
+        from_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0)
+        deals = mt5.history_deals_get(from_date, datetime.now(timezone.utc), position=ticket)
+        if not deals:
+            return None
+        # Энэ position-д хамаарах бүх deal-ийн profit нэгтгэнэ
+        total = sum(float(d.profit) + float(d.commission) + float(d.swap) for d in deals)
+        return total
 
     def disconnect(self):
         if MT5_AVAILABLE:

@@ -1,10 +1,15 @@
-import asyncio
+import html
 import requests
 from typing import Optional
 import config
 from utils.logger import get_logger
 
 log = get_logger("Telegram")
+
+
+def _esc(value) -> str:
+    """Telegram HTML parse_mode-д < > & escape хийнэ."""
+    return html.escape(str(value), quote=False)
 
 
 class TelegramNotifier:
@@ -18,28 +23,40 @@ class TelegramNotifier:
     def send(self, message: str, parse_mode: str = "HTML") -> bool:
         if not self.enabled:
             return False
-        try:
-            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            resp = requests.post(url, json={
-                "chat_id": self.chat_id,
-                "text": message,
-                "parse_mode": parse_mode,
-            }, timeout=10)
-            return resp.status_code == 200
-        except Exception as e:
-            log.error(f"Telegram мэдэгдэл алдаа: {e}")
-            return False
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        payload = {
+            "chat_id": self.chat_id,
+            "text": message,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+        }
+        # Network/Telegram алдаанд 2 удаа retry
+        for attempt in (1, 2):
+            try:
+                resp = requests.post(url, json=payload, timeout=10)
+                if resp.status_code == 200:
+                    return True
+                log.warning(f"Telegram {resp.status_code}: {resp.text[:200]}")
+                # 400 (HTML parse error) — escape хийгээд plain text-ээр дахин оролд
+                if resp.status_code == 400 and parse_mode == "HTML":
+                    payload["parse_mode"] = ""
+                    payload["text"] = html.unescape(message)
+                    continue
+                return False
+            except requests.RequestException as e:
+                log.error(f"Telegram retry={attempt}: {e}")
+        return False
 
     def notify_signal(self, symbol: str, signal: str, price: float,
                       strength: float, sentiment: str, reason: str):
         emoji = "🟢" if signal == "BUY" else "🔴" if signal == "SELL" else "⚪"
         msg = (
-            f"{emoji} <b>{signal} СИГНАЛ</b>\n"
-            f"📊 Хос: <code>{symbol}</code>\n"
+            f"{emoji} <b>{_esc(signal)} СИГНАЛ</b>\n"
+            f"📊 Хос: <code>{_esc(symbol)}</code>\n"
             f"💰 Үнэ: <code>{price:.5f}</code>\n"
             f"💪 Хүч: <code>{strength:.0%}</code>\n"
-            f"🐦 X.com: <code>{sentiment}</code>\n"
-            f"📝 {reason}"
+            f"🐦 X.com: <code>{_esc(sentiment)}</code>\n"
+            f"📝 {_esc(reason)}"
         )
         self.send(msg)
 
@@ -48,8 +65,8 @@ class TelegramNotifier:
         emoji = "📈" if action == "BUY" else "📉"
         msg = (
             f"{emoji} <b>АРИЛЖАА НЭЭГДЛЭЭ</b>\n"
-            f"📊 Хос: <code>{symbol}</code>\n"
-            f"🎯 Үйлдэл: <b>{action}</b>\n"
+            f"📊 Хос: <code>{_esc(symbol)}</code>\n"
+            f"🎯 Үйлдэл: <b>{_esc(action)}</b>\n"
             f"💰 Үнэ: <code>{price:.5f}</code>\n"
             f"📦 Хэмжээ: <code>{volume}</code>\n"
             f"🛑 Stop Loss: <code>{sl:.5f}</code>\n"
@@ -62,13 +79,13 @@ class TelegramNotifier:
         pl_str = f"+${profit_loss:.2f}" if profit_loss >= 0 else f"-${abs(profit_loss):.2f}"
         msg = (
             f"{emoji} <b>АРИЛЖАА ХААГДЛАА</b>\n"
-            f"📊 Хос: <code>{symbol}</code>\n"
+            f"📊 Хос: <code>{_esc(symbol)}</code>\n"
             f"💵 Үр дүн: <b>{pl_str}</b>"
         )
         self.send(msg)
 
     def notify_error(self, error: str):
-        msg = f"⚠️ <b>АЛДАА</b>\n<code>{error}</code>"
+        msg = f"⚠️ <b>АЛДАА</b>\n<code>{_esc(error)}</code>"
         self.send(msg)
 
     def notify_daily_report(self, balance: float, daily_pnl: float, trades: int):

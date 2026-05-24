@@ -36,12 +36,20 @@ class BinanceClient:
         try:
             data = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
             df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
             df.set_index("timestamp", inplace=True)
             return df
         except Exception as e:
             log.error(f"OHLCV авах алдаа ({symbol}): {e}")
             return None
+
+    def _min_amount(self, symbol: str) -> float:
+        """Binance market нь хосын minimum amount-ийг буцаана."""
+        try:
+            market = self.exchange.market(symbol)
+            return float(market.get("limits", {}).get("amount", {}).get("min", 0.0001))
+        except Exception:
+            return 0.0001
 
     def get_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         try:
@@ -54,6 +62,12 @@ class BinanceClient:
                     order_type: str = "market", price: Optional[float] = None) -> Optional[Dict[str, Any]]:
         try:
             side_literal = "buy" if side.lower() == "buy" else "sell"
+            # Minimum amount шалгах — Binance reject хийхээс сэргийлнэ
+            min_amt = self._min_amount(symbol)
+            if amount < min_amt:
+                log.warning(f"{symbol} amount ({amount}) < min ({min_amt}) — алгасав")
+                return None
+
             if order_type == "market":
                 order = self.exchange.create_order(symbol, "market", side_literal, amount)
             else:
@@ -61,7 +75,22 @@ class BinanceClient:
             log.info(f"Захиалга өгөгдлөө: {side} {amount} {symbol} @ {price or 'market'}")
             return order
         except Exception as e:
-            log.error(f"Захиалга өгөх алдаа: {e}")
+            log.error(f"Захиалга өгөх алдаа ({symbol} {side} {amount}): {e}")
+            return None
+
+    def place_stop_loss(self, symbol: str, side: str, amount: float,
+                        stop_price: float) -> Optional[Dict[str, Any]]:
+        """Position-ын эсрэг тал руу stop-market захиалга байршуулна."""
+        try:
+            opposite = "sell" if side.lower() == "buy" else "buy"
+            order = self.exchange.create_order(
+                symbol, "STOP_LOSS_LIMIT", opposite, amount, stop_price,
+                {"stopPrice": stop_price, "timeInForce": "GTC"}
+            )
+            log.info(f"SL захиалга: {symbol} {opposite} {amount} @ {stop_price}")
+            return order
+        except Exception as e:
+            log.error(f"SL захиалга алдаа ({symbol}): {e}")
             return None
 
     def cancel_order(self, order_id: str, symbol: str) -> bool:

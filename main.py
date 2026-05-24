@@ -34,26 +34,6 @@ class TradingBot:
 
         self.notifier.send("Trading Bot started!")
 
-    # ── Свеч хаагдахыг хүлээх ─────────────────────────────────────────────────
-
-    def _seconds_to_next_candle(self, candle_minutes: int = 60) -> int:
-        """Дараагийн свеч хаагдаад 90 секунд өнгөрөх хүртэлх хугацаа."""
-        now_ts = time.time()
-        candle_secs = candle_minutes * 60
-        # Одоогийн свечний эхлэл
-        candle_start = (now_ts // candle_secs) * candle_secs
-        # Дараагийн свечний хаалт + 90 сек buffer
-        next_run = candle_start + candle_secs + 90
-        wait = max(int(next_run - now_ts), 0)
-        return wait
-
-    def _wait_for_candle_close(self):
-        """1h свеч хаагдаад 90 секунд хүлээнэ — хуурамч сигналаас зайлсхийх."""
-        wait = self._seconds_to_next_candle(60)
-        if wait > 0:
-            log.info(f"Свеч хаагдахыг хүлээж байна... {wait//60}м {wait%60}с")
-            time.sleep(wait)
-
     # ── Crypto (Binance) ──────────────────────────────────────────────────────
 
     def run_crypto(self):
@@ -106,12 +86,27 @@ class TradingBot:
                         log.warning(f"{symbol} slippage хэтэрсэн: {price} vs {fill_price}")
                         self.notifier.notify_error(f"{symbol} slippage too high")
 
+                    # Stop-loss байрлуулах — заавал!
+                    sl_pct = config.CRYPTO_SL_PCT / 100
+                    tp_pct = config.CRYPTO_TP_PCT / 100
+                    if side == "buy":
+                        sl_price = round(fill_price * (1 - sl_pct), 2)
+                        tp_price = round(fill_price * (1 + tp_pct), 2)
+                    else:
+                        sl_price = round(fill_price * (1 + sl_pct), 2)
+                        tp_price = round(fill_price * (1 - tp_pct), 2)
+                    self.binance.place_stop_loss(symbol, side, decision.position_size, sl_price)
+
                     trade_id = open_trade(symbol, side, fill_price, decision.position_size, "binance")
                     self.open_positions[trade_id] = {
                         "symbol": symbol, "side": side,
                         "entry": fill_price, "exchange": "binance",
+                        "sl": sl_price, "tp": tp_price,
                     }
-                    self.notifier.notify_trade(symbol, signal.final_signal, fill_price, decision.position_size)
+                    self.notifier.notify_trade(
+                        symbol, signal.final_signal, fill_price,
+                        decision.position_size, sl_price, tp_price,
+                    )
 
             except Exception as e:
                 log.error(f"{symbol} error: {e}")
@@ -210,7 +205,7 @@ class TradingBot:
     # ── Breakeven мониторинг ──────────────────────────────────────────────────
 
     def check_breakeven(self):
-        """MT5 нээлттэй байрлалуудад 100 pip ашиг болоход SL-г breakeven дээр тавина."""
+        """MT5 нээлттэй байрлалуудад ашиг хүрэхэд SL-г breakeven дээр тавина."""
         for trade_id, pos in list(self.open_positions.items()):
             if pos.get("exchange") != "mt5" or pos.get("breakeven_moved"):
                 continue
@@ -219,7 +214,8 @@ class TradingBot:
                 continue
             current = tick["last"]
             should_be = self.risk.should_move_to_breakeven(
-                pos["side"], pos["entry"], current, pos.get("point", 0.00001)
+                pos["side"], pos["entry"], current,
+                pos.get("point", 0.00001), pos["symbol"],
             )
             if should_be:
                 moved = self.mt5.move_sl_to_breakeven(pos["ticket"], pos["entry"])
@@ -229,16 +225,37 @@ class TradingBot:
                         f"Breakeven set: {pos['symbol']} ticket={pos['ticket']}"
                     )
 
+    # ── Хаагдсан позицүүдийг бүртгэх ─────────────────────────────────────────
+
+    def sync_closed_positions(self):
+        """MT5 дээр SL/TP-ээр хаагдсан позицүүдийг шалгаж DB-д хаалт бүртгэнэ."""
+        if not self.mt5.connected:
+            return
+        open_tickets = {p.ticket for p in self.mt5.get_open_positions()}
+        for trade_id, pos in list(self.open_positions.items()):
+            if pos.get("exchange") != "mt5":
+                continue
+            ticket = pos.get("ticket")
+            if ticket and ticket not in open_tickets:
+                # Уг ticket брокер дээр хаагдсан → P&L татна
+                pnl = self.mt5.get_closed_position_pnl(ticket) or 0.0
+                close_trade(trade_id, pnl)
+                self.notifier.notify_close(pos["symbol"], pnl)
+                log.info(f"Position closed: {pos['symbol']} ticket={ticket} pnl={pnl:+.2f}")
+                del self.open_positions[trade_id]
+
     # ── Өдрийн тайлан ─────────────────────────────────────────────────────────
 
     def daily_report(self):
         stats = self.risk.get_daily_stats()
-        balance = self.binance.get_balance("USDT")
+        crypto_bal = self.binance.get_balance("USDT")
+        mt5_bal = self.mt5.get_balance() if self.mt5.connected else 0.0
+        total_balance = crypto_bal + mt5_bal
         self.notifier.notify_daily_report(
-            balance, stats["total_pnl"], stats["trade_count"]
+            total_balance, stats["total_pnl"], stats["trade_count"]
         )
         log.info(
-            f"Daily report | balance=${balance:.2f} | "
+            f"Daily report | crypto=${crypto_bal:.2f} mt5=${mt5_bal:.2f} | "
             f"pnl={stats['total_pnl']:+.2f} | trades={stats['trade_count']}"
         )
 
@@ -247,17 +264,16 @@ class TradingBot:
     def run(self):
         log.info("Configuring scheduler...")
 
-        def scheduled_run():
-            """Свеч хаагдаад 90 секунд хүлээгээд шинжилгээ хийнэ."""
-            self._wait_for_candle_close()
-            self.run_crypto()
-            self.run_forex()
-
-        # Цаг бүрийн шинжилгээ — свеч хаагдсаны дараа
-        schedule.every().hour.do(scheduled_run)
+        # Цаг бүрийн шинжилгээг :01:30-д ажиллуулах (свеч хаагдаад 90 сек)
+        # → scheduler-ийг блоклохгүй, breakeven болон бусад job-ууд тасралтгүй ажиллана
+        for minute in (":01",):
+            schedule.every().hour.at(f"{minute}:30").do(self.run_crypto)
+            schedule.every().hour.at(f"{minute}:30").do(self.run_forex)
 
         # 5 минут тутамд breakeven шалгана
         schedule.every(5).minutes.do(self.check_breakeven)
+        # 2 минут тутамд хаагдсан позицүүдийг бүртгэх
+        schedule.every(2).minutes.do(self.sync_closed_positions)
 
         # Өдрийн тайлан 23:55
         schedule.every().day.at("23:55").do(self.daily_report)

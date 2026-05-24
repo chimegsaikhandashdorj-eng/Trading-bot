@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 from utils.logger import get_logger
@@ -52,7 +52,8 @@ def open_trade(symbol: str, side: str, price: float, volume: float,
             """INSERT INTO trades
                (symbol, side, entry_price, volume, exchange, ticket, opened_at)
                VALUES (?,?,?,?,?,?,?)""",
-            (symbol, side, price, volume, exchange, ticket, datetime.now().isoformat())
+            (symbol, side, price, volume, exchange, ticket,
+             datetime.now(timezone.utc).isoformat())
         )
         conn.commit()
         return cur.lastrowid or 0
@@ -63,7 +64,7 @@ def close_trade(trade_id: int, pnl: float):
     with _conn() as conn:
         conn.execute(
             "UPDATE trades SET pnl=?, status='closed', closed_at=? WHERE id=?",
-            (pnl, datetime.now().isoformat(), trade_id)
+            (pnl, datetime.now(timezone.utc).isoformat(), trade_id)
         )
         # ON CONFLICT: өдрийн нийт P&L дээр нэмнэ
         conn.execute("""

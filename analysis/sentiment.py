@@ -1,4 +1,5 @@
 import time
+import threading
 import requests
 import tweepy
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ log = get_logger("Sentiment")
 # Cache: символ тутамд 30 минут кэш хадгална (rate limit хэмнэх)
 _CACHE_TTL = 1800
 _cache: dict[str, tuple[float, "SentimentSignal"]] = {}
+_cache_lock = threading.Lock()
 
 POSITIVE_WORDS = [
     "bullish", "bull", "buy", "long", "rally", "breakout",
@@ -71,17 +73,19 @@ class SentimentAnalyzer:
     # ── Cache ─────────────────────────────────────────────────────────────────
 
     def _get_cached(self, symbol: str) -> Optional["SentimentSignal"]:
-        if symbol not in _cache:
+        with _cache_lock:
+            if symbol not in _cache:
+                return None
+            cached_time, signal = _cache[symbol]
+            if time.time() - cached_time < _CACHE_TTL:
+                log.info(f"{symbol} кэшээс sentiment ашиглав ({int((time.time()-cached_time)/60)} мин өмнөх)")
+                return signal
+            del _cache[symbol]
             return None
-        cached_time, signal = _cache[symbol]
-        if time.time() - cached_time < _CACHE_TTL:
-            log.info(f"{symbol} кэшээс sentiment ашиглав ({int((time.time()-cached_time)/60)} мин өмнөх)")
-            return signal
-        del _cache[symbol]
-        return None
 
     def _set_cache(self, symbol: str, signal: "SentimentSignal"):
-        _cache[symbol] = (time.time(), signal)
+        with _cache_lock:
+            _cache[symbol] = (time.time(), signal)
 
     # ── Текст оноо ────────────────────────────────────────────────────────────
 
@@ -89,8 +93,30 @@ class SentimentAnalyzer:
         t = text.lower()
         if any(spam in t for spam in SPAM_PATTERNS):
             return 0.0   # spam tweet → 0 оноо
-        pos = sum(1 for w in POSITIVE_WORDS if w in t)
-        neg = sum(1 for w in NEGATIVE_WORDS if w in t)
+
+        # "not bullish" / "no rally" зэрэг negation-уудыг ялгана
+        pos = 0
+        neg = 0
+        for w in POSITIVE_WORDS:
+            if w not in t:
+                continue
+            # word-аас өмнө "not" / "no" / "n't" байвал neg гэж тоолно
+            idx = t.find(w)
+            window = t[max(0, idx - 8):idx]
+            if any(neg_word in window for neg_word in (" not ", " no ", "n't ")):
+                neg += 1
+            else:
+                pos += 1
+        for w in NEGATIVE_WORDS:
+            if w not in t:
+                continue
+            idx = t.find(w)
+            window = t[max(0, idx - 8):idx]
+            if any(neg_word in window for neg_word in (" not ", " no ", "n't ")):
+                pos += 1
+            else:
+                neg += 1
+
         total = pos + neg
         return 0.0 if total == 0 else (pos - neg) / total
 
