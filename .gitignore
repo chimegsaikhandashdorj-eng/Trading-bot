@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Data & logs
+data/*.db
+logs/*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/settings.local.json
