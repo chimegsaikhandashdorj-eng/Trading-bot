@@ -2,7 +2,6 @@
 Тохиргооны туслах скрипт — .env файл үүсгэж API холболт шалгана
 """
 import shutil
-import os
 from pathlib import Path
 
 

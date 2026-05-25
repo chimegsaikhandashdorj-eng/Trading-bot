@@ -1,9 +1,19 @@
 import logging
+import os
 from logging.handlers import RotatingFileHandler
-import colorlog
 from pathlib import Path
 
-Path("logs").mkdir(exist_ok=True)
+import colorlog
+
+# Test-orchchnoos chdir hiisen ued ham log directory baihgui bgaag harangdaj boldog
+# tul get_logger dotor lazy-aar uuseg ulgu, modulin tushrelyl nuhulteg duudna.
+_LOG_DIR = Path("logs")
+
+
+def _ensure_log_dir() -> Path:
+    """Resolve and create the log directory if missing."""
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    return _LOG_DIR
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -27,19 +37,25 @@ def get_logger(name: str) -> logging.Logger:
             "CRITICAL": "bold_red",
         }
     ))
-
-    # File: 10MB-аас хэтэрвэл rotate (5 файл хадгална → max 50MB)
-    file_handler = RotatingFileHandler(
-        "logs/trading_bot.log",
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-    )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    ))
-
     logger.addHandler(console)
-    logger.addHandler(file_handler)
+
+    # Test orchny shudraga (PYTEST_CURRENT_TEST) ued file handler tuusgehgui —
+    # pytest chdir per test → log file path stale bolgodog
+    if not os.getenv("PYTEST_CURRENT_TEST") and not os.getenv("DISABLE_FILE_LOG"):
+        try:
+            log_path = _ensure_log_dir() / "trading_bot.log"
+            file_handler = RotatingFileHandler(
+                log_path,
+                maxBytes=10 * 1024 * 1024,
+                backupCount=5,
+                encoding="utf-8",
+            )
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+            ))
+            logger.addHandler(file_handler)
+        except OSError:
+            # Read-only FS gh m hyzgaarlagдснnaas болж амжилтгүй болж magadgui — console only
+            pass
     return logger

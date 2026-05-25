@@ -195,7 +195,7 @@ class SentimentAnalyzer:
                 source="x.com",
             )
         except tweepy.errors.TooManyRequests:
-            log.warning(f"X.com rate limit хүрлээ — CryptoPanic руу шилжинэ")
+            log.warning("X.com rate limit хүрлээ — CryptoPanic руу шилжинэ")
             return None
         except Exception as e:
             log.error(f"X.com алдаа ({symbol}): {e}")
@@ -211,11 +211,14 @@ class SentimentAnalyzer:
 
         # Symbol-г CryptoPanic-ийн формат руу хөрвүүлэх
         cp_symbol = symbol.replace("/USDT", "").replace("XAUUSD", "XAU")
-        url = f"https://cryptopanic.com/api/v1/posts/?auth_token={api_key}&currencies={cp_symbol}&filter=hot"
+        # API key-ийг query-д бус Authorization header-ээр явуулна (logs/proxy-д leak хийхгүй)
+        url = "https://cryptopanic.com/api/v1/posts/"
+        params = {"currencies": cp_symbol, "filter": "hot", "auth_token": api_key}
 
         try:
-            resp = requests.get(url, timeout=10)
+            resp = requests.get(url, params=params, timeout=10)
             if resp.status_code != 200:
+                log.debug(f"CryptoPanic {symbol} {resp.status_code}")
                 return None
             data = resp.json().get("results", [])
             if not data:

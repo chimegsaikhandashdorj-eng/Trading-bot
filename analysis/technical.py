@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 import pandas as pd
-import pandas_ta as ta
 
 import config
 from utils.logger import get_logger
