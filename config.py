@@ -76,6 +76,13 @@ DEFAULT_LEVERAGE: int = _safe_int("DEFAULT_LEVERAGE", 1)
 CRYPTO_SL_PCT: float = _safe_float("CRYPTO_SL_PCT", 2.0)   # 2% stop loss
 CRYPTO_TP_PCT: float = _safe_float("CRYPTO_TP_PCT", 4.0)   # 4% take profit (1:2 R:R)
 
+# ──────────────────────────────────────────────────────────────────────────
+# Operational endpoints
+# ──────────────────────────────────────────────────────────────────────────
+HEALTH_HOST: str = os.getenv("HEALTH_HOST", "127.0.0.1")
+HEALTH_PORT: int = _safe_int("HEALTH_PORT", 8000)
+TELEGRAM_POLLING: bool = _safe_bool("TELEGRAM_POLLING", False)  # /commands feature
+
 # Symbol-aware pip values ($/pip per standard lot)
 PIP_VALUES: Dict[str, float] = {
     "EURUSD": 10.0,

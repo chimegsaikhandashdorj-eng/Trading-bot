@@ -137,3 +137,36 @@ def get_daily_stats(target_date: Optional[str] = None) -> Dict[str, Any]:
     if not row:
         return {"date": d, "total_pnl": 0.0, "trade_count": 0, "win_count": 0}
     return dict(row)
+
+
+def get_open_trades(exchange: Optional[str] = None) -> list[Dict[str, Any]]:
+    """
+    All trades currently in status='open'. Used at startup to reconcile
+    in-memory `open_positions` with what the broker actually holds.
+
+    Parameters
+    ----------
+    exchange:
+        Filter to "binance" or "mt5". None = all.
+    """
+    query = "SELECT * FROM trades WHERE status='open'"
+    params: tuple = ()
+    if exchange:
+        query += " AND exchange=?"
+        params = (exchange,)
+    with _conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_trade_orphan(trade_id: int) -> None:
+    """
+    Mark a DB-open trade as 'orphan' — broker no longer has the position
+    but we missed the close event. P&L recorded as 0 (unknown).
+    """
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE trades SET status='orphan', closed_at=? WHERE id=?",
+            (datetime.now(timezone.utc).isoformat(), trade_id),
+        )
+        conn.commit()

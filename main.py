@@ -27,10 +27,15 @@ import schedule
 import config
 from exchanges.binance_client import BinanceClient
 from exchanges.mt5_client import MT5Client
+from notifications.health_server import HealthServer
+from notifications.telegram_commands import TelegramCommandListener
 from notifications.telegram_notifier import TelegramNotifier
+from notifications.watchdog import Watchdog
 from risk.risk_manager import RiskManager
 from strategy.strategy import CombinedStrategy
-from utils.database import close_trade, open_trade
+from utils.database import (
+    close_trade, get_open_trades, mark_trade_orphan, open_trade,
+)
 from utils.logger import get_logger
 
 log = get_logger("Main")
@@ -53,16 +58,93 @@ class TradingBot:
         self.strategy = CombinedStrategy()
         self.risk = RiskManager()
         self.notifier = TelegramNotifier()
+        self.watchdog = Watchdog(self.notifier)
+        self.health = HealthServer(
+            self, host=config.HEALTH_HOST, port=config.HEALTH_PORT
+        )
+        self.health.start()
+        self.tg_commands = TelegramCommandListener(self)
+        self.tg_commands.start()
 
         # Open positions keyed by DB trade_id
         self.open_positions: Dict[int, Dict[str, Any]] = {}
+        self._paused: bool = False
         self._stop = False
 
+        self.reconcile_positions()
         self.notifier.send("Trading Bot started!")
+
+    # ── Reconciliation ───────────────────────────────────────────────────
+
+    def reconcile_positions(self) -> None:
+        """
+        On startup, sync the in-memory `open_positions` dict with what the
+        broker actually holds. Trades the DB thinks are open but the broker
+        no longer has are marked 'orphan' (we missed the close event).
+        """
+        try:
+            self._reconcile_mt5()
+            self._reconcile_binance()
+        except Exception as exc:
+            log.error(f"reconcile_positions failed: {exc}")
+
+    def _reconcile_mt5(self) -> None:
+        if not self.mt5.connected:
+            return
+        broker_tickets = {p.ticket for p in self.mt5.get_open_positions()}
+        for trade in get_open_trades(exchange="mt5"):
+            db_ticket_str = trade.get("ticket")
+            if not db_ticket_str:
+                continue
+            try:
+                db_ticket = int(db_ticket_str)
+            except (TypeError, ValueError):
+                continue
+            if db_ticket in broker_tickets:
+                # Load into memory so check_breakeven / sync_closed_positions can manage it
+                self.open_positions[trade["id"]] = {
+                    "symbol":   trade["symbol"],
+                    "side":     trade["side"],
+                    "entry":    trade["entry_price"],
+                    "ticket":   db_ticket,
+                    "point":    self.mt5.get_point(trade["symbol"]),
+                    "exchange": "mt5",
+                    "breakeven_moved": False,
+                }
+                log.info(
+                    f"Reconciled MT5 position: id={trade['id']} "
+                    f"{trade['symbol']} ticket={db_ticket}"
+                )
+            else:
+                mark_trade_orphan(trade["id"])
+                log.warning(
+                    f"Marked orphan: id={trade['id']} {trade['symbol']} "
+                    f"ticket={db_ticket} (no broker match)"
+                )
+
+    def _reconcile_binance(self) -> None:
+        """Binance spot positions are inferred from holdings, not tickets.
+        We re-load DB-open trades into memory so they keep their SL/TP context
+        and can be managed; orphan detection on Binance is best-effort because
+        spot has no position concept."""
+        for trade in get_open_trades(exchange="binance"):
+            self.open_positions[trade["id"]] = {
+                "symbol":   trade["symbol"],
+                "side":     trade["side"],
+                "entry":    trade["entry_price"],
+                "exchange": "binance",
+            }
+            log.info(
+                f"Reconciled Binance trade: id={trade['id']} "
+                f"{trade['symbol']} side={trade['side']}"
+            )
 
     # ── Crypto (Binance) ──────────────────────────────────────────────────
 
     def run_crypto(self) -> None:
+        if self._paused:
+            log.info("Bot paused — skipping crypto analysis")
+            return
         log.info("-- Crypto analysis starting --")
         balance = self.binance.get_balance("USDT")
 
@@ -145,6 +227,9 @@ class TradingBot:
     # ── Forex / Gold (MT5) ────────────────────────────────────────────────
 
     def run_forex(self) -> None:
+        if self._paused:
+            log.info("Bot paused — skipping forex analysis")
+            return
         if not self.mt5.connected:
             log.warning("MT5 not connected, skipping forex")
             return
@@ -315,12 +400,12 @@ class TradingBot:
         log.info("Configuring scheduler...")
 
         # Hourly run at :01:30 — past the candle close, no manual blocking sleep
-        schedule.every().hour.at(":01:30").do(self.run_crypto)
-        schedule.every().hour.at(":01:30").do(self.run_forex)
+        schedule.every().hour.at(":01:30").do(self._tick_and_run, self.run_crypto)
+        schedule.every().hour.at(":01:30").do(self._tick_and_run, self.run_forex)
 
-        schedule.every(5).minutes.do(self.check_breakeven)
-        schedule.every(2).minutes.do(self.sync_closed_positions)
-        schedule.every().day.at("23:55").do(self.daily_report)
+        schedule.every(5).minutes.do(self._tick_and_run, self.check_breakeven)
+        schedule.every(2).minutes.do(self._tick_and_run, self.sync_closed_positions)
+        schedule.every().day.at("23:55").do(self._tick_and_run, self.daily_report)
 
         # Optional immediate analysis cycle so first signals don't wait an hour
         log.info("Running initial analysis...")
@@ -332,9 +417,57 @@ class TradingBot:
             schedule.run_pending()
             time.sleep(15)
 
+    def _tick_and_run(self, fn) -> None:
+        """Tick the watchdog, then run `fn`. Swallow exceptions per-job."""
+        self.watchdog.tick()
+        try:
+            fn()
+        except Exception as exc:
+            log.error(f"Scheduled job {fn.__name__} failed: {exc}")
+
+    # ── Control surface (used by Telegram /commands and tests) ──────────
+
+    def pause(self) -> None:
+        """Stop opening new positions. Existing positions remain managed."""
+        self._paused = True
+        log.warning("Bot paused — no new entries will be taken")
+
+    def resume(self) -> None:
+        """Resume opening new positions."""
+        self._paused = False
+        log.info("Bot resumed")
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def status_snapshot(self) -> Dict[str, Any]:
+        """Compact runtime status — used by /status and /health."""
+        stats = self.risk.get_daily_stats()
+        return {
+            "paused": self._paused,
+            "binance_connected": self.binance is not None,
+            "mt5_connected": self.mt5.connected,
+            "open_positions": len(self.open_positions),
+            "daily_pnl": stats["total_pnl"],
+            "daily_trades": stats["trade_count"],
+        }
+
     def stop(self) -> None:
         log.info("Shutdown requested")
         self._stop = True
+        try:
+            self.tg_commands.stop()
+        except Exception:
+            pass
+        try:
+            self.health.stop()
+        except Exception:
+            pass
+        try:
+            self.watchdog.stop()
+        except Exception:
+            pass
         try:
             self.notifier.shutdown()
         except Exception:
