@@ -171,8 +171,9 @@ def run_backtest(
 
         # ── Manage open trade first ───────────────────────────────────────
         if open_trade is not None:
+            # Pass bar_open so gap fills are priced realistically (not at SL price)
             sl_hit, tp_hit, exit_price, reason = _check_exit(
-                open_trade, bar_high, bar_low, sl_pct, tp_pct
+                open_trade, bar_open, bar_high, bar_low, sl_pct, tp_pct
             )
             if sl_hit or tp_hit:
                 _finalize(open_trade, i, exit_price, reason)
@@ -211,17 +212,34 @@ def run_backtest(
 
 
 def _check_exit(
-    trade: Trade, high: float, low: float, sl_pct: float, tp_pct: float
+    trade: Trade,
+    bar_open: float,
+    high: float,
+    low: float,
+    sl_pct: float,
+    tp_pct: float,
 ):
     """
     Determine whether the bar's range crossed SL or TP.
-    Pessimistic assumption: if both are hit in the same bar, SL wins.
+
+    Realism guarantees
+    ------------------
+    * Pessimistic when both SL and TP are inside one bar — SL wins.
+    * **Gap fills** are priced at `bar_open`, not at the trigger price.
+      Backtests that ignore this consistently over-estimate Sharpe
+      because gap-down fills on BUY positions hurt more than `sl_price`.
     """
     sl_frac = sl_pct / 100
     tp_frac = tp_pct / 100
     if trade.signal == "BUY":
         sl_price = trade.entry * (1 - sl_frac)
         tp_price = trade.entry * (1 + tp_frac)
+        # GAP DOWN: open already below SL → fill at open (worse than sl_price)
+        if bar_open <= sl_price:
+            return True, False, bar_open, "sl_gap"
+        # GAP UP: open already above TP → fill at open (better than tp_price)
+        if bar_open >= tp_price:
+            return False, True, bar_open, "tp_gap"
         sl_hit = low <= sl_price
         tp_hit = high >= tp_price
         if sl_hit:
@@ -231,6 +249,12 @@ def _check_exit(
     else:  # SELL
         sl_price = trade.entry * (1 + sl_frac)
         tp_price = trade.entry * (1 - tp_frac)
+        # GAP UP: open already above SL → fill at open (worse)
+        if bar_open >= sl_price:
+            return True, False, bar_open, "sl_gap"
+        # GAP DOWN: open already below TP → fill at open (better)
+        if bar_open <= tp_price:
+            return False, True, bar_open, "tp_gap"
         sl_hit = high >= sl_price
         tp_hit = low <= tp_price
         if sl_hit:

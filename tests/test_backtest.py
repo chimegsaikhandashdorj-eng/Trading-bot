@@ -13,10 +13,12 @@ def _trade(signal="BUY", entry=100.0):
     )
 
 
+# ── Intrabar SL/TP (gap-free) ──────────────────────────────────────────
+
 def test_sl_hits_first_when_both_in_bar():
     """If a bar covers both SL and TP, pessimistic exit is SL."""
     t = _trade("BUY", 100.0)
-    sl, tp, price, reason = _check_exit(t, high=110, low=90, sl_pct=2, tp_pct=4)
+    sl, tp, price, reason = _check_exit(t, bar_open=100, high=110, low=90, sl_pct=2, tp_pct=4)
     assert sl and not tp
     assert reason == "sl"
     assert price == 98.0
@@ -24,23 +26,63 @@ def test_sl_hits_first_when_both_in_bar():
 
 def test_tp_hits_alone():
     t = _trade("BUY", 100.0)
-    sl, tp, price, reason = _check_exit(t, high=105, low=99, sl_pct=2, tp_pct=4)
+    sl, tp, price, reason = _check_exit(t, bar_open=100, high=105, low=99, sl_pct=2, tp_pct=4)
     assert tp and not sl
     assert price == 104.0
 
 
 def test_no_exit_within_range():
     t = _trade("BUY", 100.0)
-    sl, tp, _, _ = _check_exit(t, high=101, low=99, sl_pct=2, tp_pct=4)
+    sl, tp, _, _ = _check_exit(t, bar_open=100, high=101, low=99, sl_pct=2, tp_pct=4)
     assert not sl and not tp
 
 
 def test_sell_sl_above_entry():
     t = _trade("SELL", 100.0)
-    sl, tp, price, _ = _check_exit(t, high=103, low=99, sl_pct=2, tp_pct=4)
+    sl, tp, price, _ = _check_exit(t, bar_open=100, high=103, low=99, sl_pct=2, tp_pct=4)
     assert sl
     assert price == 102.0
 
+
+# ── Gap fills (the bug we just fixed) ──────────────────────────────────
+
+def test_buy_gap_down_fills_at_open_not_sl_price():
+    """BUY position, bar opens below SL — fill at open (worse than SL price)."""
+    t = _trade("BUY", 100.0)
+    sl, tp, price, reason = _check_exit(t, bar_open=95, high=96, low=94, sl_pct=2, tp_pct=4)
+    assert sl and not tp
+    assert reason == "sl_gap"
+    assert price == 95.0   # not 98 (sl_price) — open is worse
+
+
+def test_buy_gap_up_fills_at_open_better_than_tp_price():
+    """BUY position, bar opens above TP — fill at open (better than TP price)."""
+    t = _trade("BUY", 100.0)
+    sl, tp, price, reason = _check_exit(t, bar_open=106, high=107, low=105, sl_pct=2, tp_pct=4)
+    assert tp and not sl
+    assert reason == "tp_gap"
+    assert price == 106.0   # better than 104 (tp_price)
+
+
+def test_sell_gap_up_fills_at_open():
+    """SELL position, bar opens above SL — fill at open (worse than SL price)."""
+    t = _trade("SELL", 100.0)
+    sl, tp, price, reason = _check_exit(t, bar_open=103, high=104, low=102, sl_pct=2, tp_pct=4)
+    assert sl and not tp
+    assert reason == "sl_gap"
+    assert price == 103.0
+
+
+def test_sell_gap_down_fills_at_open():
+    """SELL position, bar opens below TP — fill at open (better than TP price)."""
+    t = _trade("SELL", 100.0)
+    sl, tp, price, reason = _check_exit(t, bar_open=95, high=96, low=94, sl_pct=2, tp_pct=4)
+    assert tp and not sl
+    assert reason == "tp_gap"
+    assert price == 95.0
+
+
+# ── Aggregate metrics ──────────────────────────────────────────────────
 
 def test_finalize_computes_pnl_pct():
     t = _trade("BUY", 100.0)

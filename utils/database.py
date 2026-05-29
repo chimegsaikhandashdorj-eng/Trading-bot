@@ -20,10 +20,21 @@ DB_PATH: str = "data/trades.db"
 
 
 def _conn() -> sqlite3.Connection:
-    """Return a SQLite connection with row factory + ensured parent dir."""
+    """
+    Return a SQLite connection with row factory + ensured parent dir.
+
+    Hardened for the multi-threaded runtime:
+    - `check_same_thread=False` so the Telegram listener thread can read stats
+    - `timeout=30` so concurrent writers wait for the lock instead of erroring
+    - `journal_mode=WAL` enables concurrent reads while a writer is active
+    - `synchronous=NORMAL` is the WAL-recommended durability/perf tradeoff
+    """
     Path("data").mkdir(exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # PRAGMAs are idempotent — applying on every connection is cheap
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 

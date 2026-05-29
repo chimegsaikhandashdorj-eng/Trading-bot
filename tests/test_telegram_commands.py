@@ -18,10 +18,10 @@ def fake_bot():
         "daily_pnl": -5.0,
         "daily_trades": 4,
     }
-    bot.open_positions = {
-        1: {"exchange": "binance", "symbol": "BTC/USDT", "side": "buy", "entry": 50000.0},
-        2: {"exchange": "mt5", "symbol": "EURUSD", "side": "sell", "entry": 1.1},
-    }
+    bot.open_positions.snapshot.return_value = [
+        (1, {"exchange": "binance", "symbol": "BTC/USDT", "side": "buy", "entry": 50000.0}),
+        (2, {"exchange": "mt5", "symbol": "EURUSD", "side": "sell", "entry": 1.1}),
+    ]
     return bot
 
 

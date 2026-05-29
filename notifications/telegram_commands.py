@@ -139,11 +139,12 @@ class TelegramCommandListener:
         )
 
     def _render_positions(self) -> str:
-        positions = self.bot.open_positions
-        if not positions:
+        # `snapshot()` copies under lock, safe to iterate in this thread.
+        snapshot = self.bot.open_positions.snapshot()
+        if not snapshot:
             return "No open positions."
         lines = ["<b>OPEN POSITIONS</b>"]
-        for tid, p in positions.items():
+        for tid, p in snapshot:
             ex = p.get("exchange", "?")
             symbol = p.get("symbol", "?")
             side = p.get("side", "?")
